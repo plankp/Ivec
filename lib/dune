@@ -1,0 +1,9 @@
+(library
+ (name ivec)
+ (libraries zarith menhirLib))
+
+(ocamllex Lexer)
+
+(menhir
+ (modules Parser)
+ (flags --table --explain))
