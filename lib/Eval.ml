@@ -1,43 +1,40 @@
 type v =
   | Str of string
   | Int of Z.t
-  | Seq of v list
-
-type s = unit
+  | Vec of v Array.t
 
 let rec to_buffer buf = function
   | Str s -> Buffer.add_string buf s
   | Int v -> Z.bprint buf v
-  | Seq [] -> Buffer.add_string buf "[]"
-  | Seq [x] ->
-    Buffer.add_char buf '[';
-    to_buffer buf x;
-    Buffer.add_char buf ']'
-  | Seq (x :: xs) ->
-    Buffer.add_char buf '[';
-    to_buffer buf x;
-    List.iter (fun v -> Buffer.add_char buf ' '; to_buffer buf v) xs;
-    Buffer.add_char buf ']'
+  | Vec v ->
+    Buffer.add_char buf '(';
+    Array.iteri (fun i e ->
+      if i <> 0 then Buffer.add_char buf ' ';
+      to_buffer buf e) v;
+    Buffer.add_char buf ')'
 
 let to_string = function
   | Str s -> s
   | Int v -> Z.to_string v
-  | Seq [] -> "[]"
   | v ->
     let buf = Buffer.create 16 in
     to_buffer buf v;
     Buffer.contents buf
 
-let init_state : s = ()
+module M = Map.Make (String)
+
+type s = v M.t
+
+let init_state : s = M.empty
 
 let ( let< ) = Result.bind
 
 let broadcast_numeric f l r =
   let rec helper = function
     | Int l, Int r -> Int (f l r)
-    | Seq l, Seq r -> Seq (List.map2 (fun l r -> helper (l, r)) l r)
-    | l, Seq r -> Seq (List.map (fun r -> helper (l, r)) r)
-    | Seq l, r -> Seq (List.map (fun l -> helper (l, r)) l)
+    | Vec l, Vec r -> Vec (Array.map2 (fun l r -> helper (l, r)) l r)
+    | l, Vec r -> Vec (Array.map (fun r -> helper (l, r)) r)
+    | Vec l, r -> Vec (Array.map (fun l -> helper (l, r)) l)
     | _ -> failwith "Type mismatch" in
   try
     Ok (helper (l, r))
@@ -50,7 +47,7 @@ let rec eval s = function
   | Ast.EInt v -> Ok (Int v)
   | Ast.ESeq v -> begin
     let rec loop acc = function
-      | [] -> Ok (Seq (List.rev acc))
+      | [] -> Ok (Vec (acc |> List.rev |> Array.of_list))
       | x :: xs -> let< x = eval s x in loop (x :: acc) xs in
     loop [] v
   end

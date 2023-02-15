@@ -7,6 +7,9 @@ let () =
     match v with
       | None -> Ok None
       | Some v ->
+        let< (g, t) = Ivec.Gir.check v in
+        t |> Ivec.Gir.to_string |> print_endline;
+        Ivec.Gir.dump g; print_endline "";
         let< v = Ivec.Eval.eval state v in
         Ok (Some v) in
   let rec loop state =
