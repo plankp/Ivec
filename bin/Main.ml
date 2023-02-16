@@ -1,7 +1,7 @@
 let ( let< ) = Result.bind
 
 let () =
-  let process_line state =
+  let process_line () =
     let< v = Ivec.Driver.read_stdin () in
     let< v = Ivec.Driver.parse Ivec.Parser.Incremental.prog v in
     match v with
@@ -9,15 +9,16 @@ let () =
       | Some v ->
         let< (g, t) = Ivec.Gir.check v in
         t |> Ivec.Gir.to_string |> print_endline;
-        Ivec.Gir.dump g; print_endline "";
-        let< v = Ivec.Eval.eval state v in
+        (*let g = Ivec.Gir.to_anf g (fun x -> x) in*)
+        let ibuf = Ivec.Bcode.compile Ivec.Bcode.init_cgstate g in
+        let< v = Ivec.Bcode.eval ibuf Ivec.Bcode.init_evalstate in
         Ok (Some v) in
-  let rec loop state =
+  let rec loop () =
     try
-      let () = match process_line state with
+      let () = match process_line () with
         | Ok None -> ()
-        | Ok (Some v) -> v |> Ivec.Eval.to_string |> print_endline
+        | Ok (Some v) -> v |> Ivec.Bcode.to_string |> print_endline
         | Error e -> print_endline e in
-      loop state
+      loop ()
     with End_of_file -> () in
-  loop Ivec.Eval.init_state
+  loop ()

@@ -32,19 +32,21 @@ let lnode_unlink (node : 'a cnode) =
   node.next <- node
 
 type gnode =
-  | Undef
   | LetVal of binder * gnode * gnode
   | Lam of binder * gnode
   | Var of binder cnode
   | Int of Z.t
   | Str of string
   | Vec of gnode list
-  | Add of gnode * gnode
-  | Sub of gnode * gnode
+  | PrimBop of prim_bop * gnode * gnode
   | Insert of gnode * int * gnode
 (* mapk : trip count * appf * v1 * ... * vk *)
   | Map1 of int option * gnode * gnode
   | Map2 of int option * gnode * gnode * gnode
+
+and prim_bop =
+  | Add
+  | Sub
 
 and binder = {
   name : string option;               (* binding name (for humans) *)
@@ -127,7 +129,7 @@ let rec try_numeric_broadcast op (p, pty) (q, qty) =
   match pty, qty with
     | TInt, TInt -> Ok (op p q, TInt)
 
-    | TVec (t, trip), TInt -> emit_map1 q t trip p pty true
+    | TVec (t, trip), TInt -> emit_map1 p t trip q qty true
     | TInt, TVec (t, trip) -> emit_map1 q t trip p pty false
 
     (* give up if the sizes are known and different *)
@@ -155,7 +157,7 @@ let rec check = function
   | Ast.EAdd (p, q) -> begin
     let< lhs = check p in
     let< rhs = check q in
-    match try_numeric_broadcast (fun p q -> Add (p, q)) lhs rhs with
+    match try_numeric_broadcast (fun p q -> PrimBop (Add, p, q)) lhs rhs with
       | Ok _ as v -> v
       | Error (p, q) ->
         Error ("Unsupported " ^ (to_string p) ^ " + " ^ (to_string q))
@@ -163,16 +165,63 @@ let rec check = function
   | Ast.ESub (p, q) -> begin
     let< lhs = check p in
     let< rhs = check q in
-    match try_numeric_broadcast (fun p q -> Sub (p, q)) lhs rhs with
+    match try_numeric_broadcast (fun p q -> PrimBop (Sub, p, q)) lhs rhs with
       | Ok _ as v -> v
       | Error (p, q) ->
-        Error ("Unsupported " ^ (to_string p) ^ " + " ^ (to_string q))
+        Error ("Unsupported " ^ (to_string p) ^ " - " ^ (to_string q))
   end
+
+let rec to_anf e k =
+  match e with
+    (* simple values are consumed directly *)
+    | Var _ | Int _ | Str _ | Vec [] -> k e
+
+    (* lambdas start a whole new continuation context *)
+    | Lam (v, e) ->
+      k (Lam (v, to_anf e (fun x -> x)))
+
+    (* letval just needs to make sure the initializer is simple *)
+    | LetVal (v, i, e) ->
+      to_anf i (fun i -> LetVal (v, i, to_anf e k))
+
+    (* we'll treat non-empty vectors as simple values for now... *)
+    | Vec xs ->
+      let rec loop acc = function
+        | [] -> k (Vec (List.rev acc))
+        | x :: xs -> to_anf x (fun x -> loop (x :: acc) xs) in
+      loop [] xs
+
+    | PrimBop (bop, p, q) ->
+      to_anf p (fun p -> to_anf q (fun q ->
+        let binder = mk_binder None in
+        let node = mk_cnode binder in
+        binder.occ <- Some node;
+        LetVal (binder, PrimBop (bop, p, q), k (Var node))))
+
+    | Insert (v, i, e) ->
+      to_anf v (fun v -> to_anf e (fun e ->
+        let binder = mk_binder None in
+        let node = mk_cnode binder in
+        binder.occ <- Some node;
+        LetVal (binder, Insert (v, i, e), k (Var node))))
+
+    | Map1 (tc, f, v) ->
+      to_anf f (fun f -> to_anf v (fun v ->
+        let binder = mk_binder None in
+        let node = mk_cnode binder in
+        binder.occ <- Some node;
+        LetVal (binder, Map1 (tc, f, v), k (Var node))))
+
+    | Map2 (tc, f, v1, v2) ->
+      to_anf f (fun f -> to_anf v1 (fun v1 -> to_anf v2 (fun v2 ->
+        let binder = mk_binder None in
+        let node = mk_cnode binder in
+        binder.occ <- Some node;
+        LetVal (binder, Map2 (tc, f, v1, v2), k (Var node)))))
 
 (* beyond this point it's just some gnode visualization code *)
 
 let rec dump = function
-  | Undef -> print_string "#UNDEF#"
   | Int v -> Z.output stdout v
   | Str v -> Printf.printf "%S" v
   | Vec vs ->
@@ -188,16 +237,12 @@ let rec dump = function
     Printf.printf " %d " i;
     dump e;
     print_char ')'
-  | Add (p, q) ->
+  | PrimBop (bop, p, q) ->
     print_char '(';
     dump p;
-    print_string " + ";
-    dump q;
-    print_char ')'
-  | Sub (p, q) ->
-    print_char '(';
-    dump p;
-    print_string " - ";
+    print_string (match bop with
+      | Add -> " + "
+      | Sub -> " - ");
     dump q;
     print_char ')'
   | Map1 (tc, appf, v) ->
