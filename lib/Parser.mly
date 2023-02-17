@@ -3,7 +3,8 @@ open Ast
 %}
 
 %token LPAREN RPAREN
-%token ADD SUB
+%token ADD SUB SET
+%token LET IN
 %token <Z.t> INT
 %token <string> STR
 %token <string> IDENT
@@ -19,6 +20,7 @@ prog:
 
 expr:
   | e = expr_infix { e }
+  | LET; n = IDENT; SET; i = expr; IN; e = expr { ELet (n, i, e) }
 
 expr_infix:
   | l = expr_infix; ADD; r = expr_prefix { EAdd (l, r) }
@@ -36,6 +38,7 @@ expr_vector:
 expr_atom:
   | LPAREN; RPAREN { ESeq [] }
   | LPAREN; e = expr; RPAREN; { e }
+  | v = IDENT { EVar v }
   | v = INT { EInt v }
   | v = STR { EStr v }
 

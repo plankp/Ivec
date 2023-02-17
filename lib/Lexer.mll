@@ -50,10 +50,13 @@ rule read = parse
   | ' ' | '\t' { read lexbuf }
   | newline { Lexing.new_line lexbuf; read lexbuf }
 
-  | '(' { LPAREN }
-  | ')' { RPAREN }
-  | '+' { ADD }
-  | '-' { SUB }
+  | '('     { LPAREN }
+  | ')'     { RPAREN }
+  | '+'     { ADD }
+  | '-'     { SUB }
+  | '='     { SET }
+  | "let"   { LET }
+  | "in"    { IN }
 
   | '\"' { read_string (Buffer.create 32) lexbuf }
   | ['+' '-']? ['1'-'9'] ('_'? digit_dec)* as tl { INT (str_to_int 10 tl) }

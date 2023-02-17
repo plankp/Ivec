@@ -141,7 +141,31 @@ let rec try_numeric_broadcast op (p, pty) (q, qty) =
 
     | _ -> Error (pty, qty)
 
-let rec check = function
+module M = Map.Make (String)
+
+type checkstate = (binder * t) M.t
+
+let init_checkstate : checkstate =
+  M.empty
+
+let rec check s = function
+  | Ast.EVar v -> begin
+    match M.find_opt v s with
+      | None -> Error ("Binding " ^ v ^ " has not been defined")
+      | Some (binder, t) ->
+        (* this must be a free occurrence, so we just update the binder to
+         * point to this newly created cnode. *)
+        let node = mk_cnode binder in
+        binder.occ <- Some node;
+        Ok (Var node, t)
+  end
+  | Ast.ELet (v, i, e) -> begin
+    let< (i, ity) = check s i in
+    let binder = mk_binder (Some v) in
+    let< (e, ety) = check (M.add v (binder, ity) s) e in
+    Ok (LetVal (binder, i, e), ety)
+  end
+
   | Ast.EStr v -> Ok (Str v, TStr)
   | Ast.EInt v -> Ok (Int v, TInt)
   | Ast.ESeq [] -> Ok (Vec [], TVec (TAny, Some 0))
@@ -149,22 +173,22 @@ let rec check = function
     let rec loop acc k ty = function
       | [] -> Ok (Vec (List.rev acc), TVec (ty, Some k))
       | v :: vs ->
-        let< (v, rty) = check v in
+        let< (v, rty) = check s v in
         loop (v :: acc) (k + 1) (unify ty rty) vs in
-    let< (v, ty) = check v in
+    let< (v, ty) = check s v in
     loop [v] 1 ty vs
   end
   | Ast.EAdd (p, q) -> begin
-    let< lhs = check p in
-    let< rhs = check q in
+    let< lhs = check s p in
+    let< rhs = check s q in
     match try_numeric_broadcast (fun p q -> PrimBop (Add, p, q)) lhs rhs with
       | Ok _ as v -> v
       | Error (p, q) ->
         Error ("Unsupported " ^ (to_string p) ^ " + " ^ (to_string q))
   end
   | Ast.ESub (p, q) -> begin
-    let< lhs = check p in
-    let< rhs = check q in
+    let< lhs = check s p in
+    let< rhs = check s q in
     match try_numeric_broadcast (fun p q -> PrimBop (Sub, p, q)) lhs rhs with
       | Ok _ as v -> v
       | Error (p, q) ->
