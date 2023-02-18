@@ -35,15 +35,31 @@ let lnode_count (node : 'a cnode) =
     if curp == node then sz else loop (sz + 1) curp.next in
   loop 1 node.next
 
+(* here we encode a data type to represent the graph intermediate
+ * representation, which is inspired by the "Compiling with Continuations,
+ * Continued" paper.
+ *
+ * type gnode encodes all possible expressions (including values) and
+ * more-or-less allows representing direct style terms!
+ *
+ * type binder holds part of the magic used to name intermediate computations.
+ * following the paper, it is a node in a union-find structure that either
+ * points to another binder or information about how the binder is introduced
+ * (e.g. it's a let binding, lambda, whatever). if the binder will also point
+ * to one of its free occurrence (provided there is at least one).
+ *
+ * each free occurrence points to the corresponding binder (chain) and is a circular
+ * (doubly) linked list with the other free occurrences. *)
+
 type gnode =
-  | LetVal of binder * gnode * gnode
-  | Lam of binder * gnode
+  | Binder of binder * gnode  (* must hold a well-behaved root binder *)
   | Var of binder cnode
   | Int of Z.t
   | Str of string
   | Vec of gnode list
   | PrimBop of prim_bop * gnode * gnode
   | Insert of gnode * int * gnode
+  | Apply of gnode * gnode
 (* mapk : trip count * appf * v1 * ... * vk *)
   | Map1 of int option * gnode * gnode
   | Map2 of int option * gnode * gnode * gnode
@@ -52,44 +68,46 @@ and prim_bop =
   | Add
   | Sub
 
+and bndr_ctx =
+(* a CtxChain is either a link to another binder / union-find node or a
+ * undefined root binder (if it is a self-loop). *)
+  | CtxChain of binder
+(* otherwise, a binder is considered a well-behaved root binder *)
+  | CtxLam
+  | CtxLet of gnode
+
 and binder = {
-  name : string option;               (* binding name (for humans) *)
-  mutable occ : binder cnode option;  (* one of the (usage) occurrences *)
-  mutable parent : binder;            (* union-find *)
+  name : string option;
+  mutable occ : binder cnode option;
+  mutable ctx : bndr_ctx;
 }
 
+let rec find_root_binder (b : binder) =
+  match b.ctx with
+    | CtxChain chain when chain != b ->
+      (* it's not the root; do path compression *)
+      let root = find_root_binder chain in
+      (* always hold a ptr to the root for sanity reasons *)
+      b.ctx <- CtxChain root;
+      root
+    | _ -> b
+
+let dummy = ref 0
 let mk_binder (name : string option) : binder =
-  let rec node = { name; occ = None; parent = node } in node
+  let name = if name <> None then name else begin
+    dummy := !dummy + 1;
+    Some ("$" ^ (string_of_int !dummy))
+  end in
+  let rec node = { name; occ = None; ctx = CtxChain node } in node
 
 let mk_free_occ (b : binder) : gnode =
+  let b = find_root_binder b in
   let node = mk_cnode b in
-  (* make sure it links to previous occurrences if necessary *)
+  (* make sure the new node is added to the occurrence list *)
   let () = match b.occ with
     | None -> b.occ <- Some node
     | Some occ -> lnode_link occ node in
   Var node
-
-let find_root_binder (b : binder) =
-  if b.parent == b || b.parent.parent == b.parent then
-    (* either this is the root or is directly linked to the root *)
-    b.parent
-  else
-    (* there is at least one extra node between this node and the root:
-     * we want to do path compression *)
-    let rec compress root = function
-      | [] -> root
-      | x :: xs -> x.parent <- root; compress root xs in
-    let rec find_root acc b =
-      if b.parent == b then compress b.parent acc
-      else find_root (b :: acc) b.parent in
-    find_root [b] b.parent
-
-let merge_binders (repr : binder) (aug : binder) =
-  let repr = find_root_binder repr in
-  let aug = find_root_binder aug in
-
-  (* always add new nodes under the selected representative's root *)
-  if repr != aug then aug.parent <- repr
 
 type t =
   | TAny
@@ -121,7 +139,8 @@ let rec try_numeric_broadcast op (p, pty) (q, qty) =
     let lhs = if flip then (node, eltTy) else (scl, sclTy) in
     let rhs = if flip then (scl, sclTy) else (node, eltTy) in
     let< (body, ty) = try_numeric_broadcast op lhs rhs in
-    Ok (Map1 (trip, Lam (binder, body), vec), TVec (ty, trip)) in
+    binder.ctx <- CtxLam;
+    Ok (Map1 (trip, Binder (binder, body), vec), TVec (ty, trip)) in
 
   let emit_map2 v1 eltTy1 v2 eltTy2 trip =
     (* map2 feeds two values, so we need two binders *)
@@ -132,7 +151,9 @@ let rec try_numeric_broadcast op (p, pty) (q, qty) =
 
     let< (body, ty) = try_numeric_broadcast
       op (lhsNode, eltTy1) (rhsNode, eltTy2) in
-    Ok (Map2 (trip, Lam (lhsBinder, (Lam (rhsBinder, body))), v1, v2),
+    lhsBinder.ctx <- CtxLam;
+    rhsBinder.ctx <- CtxLam;
+    Ok (Map2 (trip, Binder (lhsBinder, (Binder (rhsBinder, body))), v1, v2),
       TVec (ty, trip)) in
 
   match pty, qty with
@@ -167,7 +188,8 @@ let rec check s = function
     let< (i, ity) = check s i in
     let binder = mk_binder (Some v) in
     let< (e, ety) = check (M.add v (binder, ity) s) e in
-    Ok (LetVal (binder, i, e), ety)
+    binder.ctx <- CtxLet i;
+    Ok (Binder (binder, e), ety)
   end
 
   | Ast.EStr v -> Ok (Str v, TStr)
@@ -199,112 +221,226 @@ let rec check s = function
         Error ("Unsupported " ^ (to_string p) ^ " - " ^ (to_string q))
   end
 
-let drop gnode =
-  let rec loop = function
-    | [] -> ()
-    | Var n :: xs -> begin
-      let binder = find_root_binder n.data in
-      let () = match binder.occ with
-        | Some r when r == n ->
-          if lnode_is_singleton n then
-            (* this was the last occurrence, so once dropped, binder will
-             * have no more occurrences left / None *)
-            binder.occ <- None
-          else
-            (* update the binder to point to another free occurrence *)
-            binder.occ <- Some n.prev
-        | _ -> () in
-      (* then we drop this node *)
-      lnode_unlink n;
-      (* and continue dropping remaining nodes *)
-      loop xs
-    end
-    | (Int _ | Str _) :: xs -> loop xs
-    | LetVal (_, i, e) :: xs -> loop (i :: e :: xs)
-    | Lam (_, e) :: xs -> loop (e :: xs)
-    | Vec ys :: xs -> loop ys; loop xs
-    | PrimBop (_, x, y) :: xs -> loop (x :: y :: xs)
-    | Insert (v, _, e) :: xs -> loop (v :: e :: xs)
-    | Map1 (_, f, v) :: xs -> loop (f :: v :: xs)
-    | Map2 (_, f, v1, v2) :: xs -> loop (f :: v1 :: v2 :: xs) in
-  loop [gnode]
-
-let rec opt s = function
-  | LetVal ({ occ = None; _ }, i, e) -> drop i; opt s e
-  | LetVal (v, i, e) -> begin
-    match opt s i with
-      | Var n as node ->
-        (* merge the current let binding into the other one *)
-        let group = find_root_binder n.data in
-        merge_binders group v;
-        (* fix up the free occurrences *)
-        lnode_link n (Option.get v.occ);
-        drop node;
-        (* and then optimize the rhs *)
-        opt s e
-      | (Int _ | Str _) as i -> opt ((v, i) :: s) e
-      | i ->
-        let e = opt s e in
-        match v.occ with
-          | None -> drop i; e
-          | _ -> LetVal (v, i, e)
-  end
-  | Var v as node -> begin
-    match List.assq_opt (find_root_binder v.data) s with
-      | Some v -> drop node; v
-      | None -> node
-  end
-  | (Int _ | Str _) as v -> v
-  | Lam (v, e) -> Lam (v, opt s e)
-  | Vec xs -> Vec (List.map (opt s) xs)
-  | PrimBop (f, x, y) -> PrimBop (f, opt s x, opt s y)
-  | Insert (v, i, e) -> Insert (opt s v, i, opt s e)
-  | Map1 (tc, f, v) -> Map1 (tc, opt s f, opt s v)
-  | Map2 (tc, f, v1, v2) -> Map2 (tc, opt s f, opt s v1, opt s v2)
-
 let rec to_anf e k =
   match e with
     (* simple values are consumed directly *)
-    | Var _ | Int _ | Str _ | Vec [] -> k e
+    | Var _ | Int _ | Str _ -> k e
 
-    (* lambdas start a whole new continuation context *)
-    | Lam (v, e) ->
-      k (Lam (v, to_anf e (fun x -> x)))
+    | Binder (bndr, e) -> begin
+      match bndr.ctx with
+        | CtxChain _ -> failwith "IMPOSSIBLE BINDER STATE FOUND"
+        | CtxLam ->
+          (* lambdas start a whole new continuation context *)
+          (* to simplify optimization passes, treat lambdas as complex *)
+          let binder = mk_binder None in
+          let node = mk_free_occ binder in
+          binder.ctx <- CtxLet (Binder (bndr, to_anf e (fun x -> x)));
+          (Binder (binder, k node))
+        | CtxLet i ->
+          (* letval just needs to make sure the initializer is simple *)
+          to_anf i (fun i -> bndr.ctx <- CtxLet i; Binder (bndr, to_anf e k))
+    end
 
-    (* letval just needs to make sure the initializer is simple *)
-    | LetVal (v, i, e) ->
-      to_anf i (fun i -> LetVal (v, i, to_anf e k))
-
-    (* we'll treat non-empty vectors as simple values for now... *)
+    (* we treat vectors as complex values to avoid nested vectors. this avoids
+     * deep recursive calls when inlining *)
     | Vec xs ->
       let rec loop acc = function
-        | [] -> k (Vec (List.rev acc))
-        | x :: xs -> to_anf x (fun x -> loop (x :: acc) xs) in
+        | x :: xs -> to_anf x (fun x -> loop (x :: acc) xs)
+        | [] ->
+          let binder = mk_binder None in
+          let node = mk_free_occ binder in
+          binder.ctx <- CtxLet (Vec (List.rev acc));
+          (Binder (binder, k node)) in
       loop [] xs
 
     | PrimBop (bop, p, q) ->
       to_anf p (fun p -> to_anf q (fun q ->
         let binder = mk_binder None in
         let node = mk_free_occ binder in
-        LetVal (binder, PrimBop (bop, p, q), k node)))
+        binder.ctx <- CtxLet (PrimBop (bop, p, q));
+        Binder (binder, k node)))
 
     | Insert (v, i, e) ->
       to_anf v (fun v -> to_anf e (fun e ->
         let binder = mk_binder None in
         let node = mk_free_occ binder in
-        LetVal (binder, Insert (v, i, e), k node)))
+        binder.ctx <- CtxLet (Insert (v, i, e));
+        Binder (binder, k node)))
+
+    | Apply (p, q) ->
+      to_anf p (fun p -> to_anf q (fun q ->
+        let binder = mk_binder None in
+        let node = mk_free_occ binder in
+        binder.ctx <- CtxLet (Apply (p, q));
+        Binder (binder, k node)))
 
     | Map1 (tc, f, v) ->
       to_anf f (fun f -> to_anf v (fun v ->
         let binder = mk_binder None in
         let node = mk_free_occ binder in
-        LetVal (binder, Map1 (tc, f, v), k node)))
+        binder.ctx <- CtxLet (Map1 (tc, f, v));
+        Binder (binder, k node)))
 
     | Map2 (tc, f, v1, v2) ->
       to_anf f (fun f -> to_anf v1 (fun v1 -> to_anf v2 (fun v2 ->
         let binder = mk_binder None in
         let node = mk_free_occ binder in
-        LetVal (binder, Map2 (tc, f, v1, v2), k node))))
+        binder.ctx <- CtxLet (Map2 (tc, f, v1, v2));
+        Binder (binder, k node))))
+
+let rec drop' = function
+  | [] -> ()
+  | Var n :: xs -> begin
+    let binder = find_root_binder n.data in
+    let () = match binder.occ with
+      | Some r when r == n ->
+        if lnode_is_singleton n then
+          (* this was the last occurrence, so once dropped, binder will
+            * have no more occurrences left / None *)
+          binder.occ <- None
+        else
+          (* update the binder to point to another free occurrence *)
+          binder.occ <- Some n.prev
+      | _ -> () in
+    (* then we drop this node *)
+    lnode_unlink n;
+    (* and continue dropping remaining nodes *)
+    drop' xs
+  end
+
+  | Binder (bndr, e) :: xs -> begin
+    match bndr.ctx with
+      | CtxChain _ -> failwith "IMPOSSIBLE BINDER STATE FOUND"
+      | CtxLam -> drop' (e :: xs)
+      | CtxLet i -> drop' (i :: e :: xs)
+  end
+
+  | (Int _ | Str _) :: xs -> drop' xs
+  | Vec ys :: xs -> drop' ys; drop' xs
+  | PrimBop (_, x, y) :: xs -> drop' (x :: y :: xs)
+  | Insert (v, _, e) :: xs -> drop' (v :: e :: xs)
+  | Apply (p, q) :: xs -> drop' (p :: q :: xs)
+  | Map1 (_, f, v) :: xs -> drop' (f :: v :: xs)
+  | Map2 (_, f, v1, v2) :: xs -> drop' (f :: v1 :: v2 :: xs)
+
+and drop gnode = drop' [gnode]
+
+(* copy is scope aware *)
+let rec copy s = function
+  | Binder ({ ctx = CtxChain _; _ }, _) ->
+    failwith "IMPOSSIBLE BINDER STATE FOUND"
+  | Binder ({ ctx = CtxLam; name; _ } as prev, e) ->
+    let next = { ctx = CtxLam; name; occ = None } in
+    Binder (next, copy ((prev, next) :: s) e)
+  | Binder ({ ctx = CtxLet i; name; _ } as prev, e) ->
+    let next = { ctx = CtxLet (copy s i); name; occ = None } in
+    Binder (next, copy ((prev, next) :: s) e)
+  | Var n -> begin
+    let root = find_root_binder n.data in
+    (* if it's in scope, then the binder is being copied, so it should be an
+     * occurrence of the newly copied binder *)
+    s |> List.assq_opt root         (* find the remapped binder *)
+    (* if not, then it means the binder was not being copied, so it should
+     * refer to the original binder *)
+      |> Option.value ~default:root
+    (* once we located the binder, create a new free occurrence of it *)
+      |> mk_free_occ
+  end
+  | Int _ | Str _ | Vec [] as v -> v
+  | Vec xs -> Vec (List.map (copy s) xs)
+  | PrimBop (op, l, r) -> PrimBop (op, copy s l, copy s r)
+  | Insert (v, i, e) -> Insert (copy s v, i, copy s e)
+  | Apply (p, q) -> Apply (copy s p, copy s q)
+  | Map1 (tc, f, v) -> Map1 (tc, copy s f, copy s v)
+  | Map2 (tc, f, v1, v2) -> Map2 (tc, copy s f, copy s v1, copy s v2)
+
+let get_value = function
+  | Var n as v -> begin
+    let binder = find_root_binder n.data in
+    match binder.ctx with
+      | CtxLet v -> v
+      | _ -> v
+  end
+  | v -> v
+
+let rec opt = function
+  | Binder ({ ctx = CtxChain _; _ }, _) ->
+    failwith "IMPOSSIBLE BINDER STATE FOUND"
+  | Binder ({ ctx = CtxLam; _ } as bndr, e) -> Binder (bndr, opt e)
+  | Binder ({ ctx = CtxLet i; occ = None; _ }, e) -> drop i; opt e
+  | Binder ({ ctx = CtxLet (Var n as node); _ } as bndr, e) -> begin
+    (* merge the binders *)
+    bndr.ctx <- CtxChain (find_root_binder n.data);
+    (* update the occurrence list *)
+    lnode_link n (Option.get bndr.occ);
+    drop node;
+    (* and then optimize the rhs *)
+    opt e
+  end
+
+  | Binder ({ ctx = CtxLet (Apply (Var f, q)); _ } as bndr, e) -> begin
+    match get_value (Var f) with
+      | Binder ({ ctx = CtxLam; name; _ } as prev, le) ->
+        let next = { ctx = CtxLet (copy [] q); name; occ = None } in
+        let i = Binder (next, copy [(prev, next)] le) in
+        let e = to_anf i (fun i -> bndr.ctx <- CtxLet i; Binder (bndr, e)) in
+        drop' [Var f; q];
+        opt e
+      | _ -> Binder (bndr, opt e)
+  end
+
+  | Binder ({ ctx = CtxLet (Map1 (_, q, Var v)); _ } as bndr, e)
+    when lnode_is_singleton v -> begin
+    match get_value (Var v) with
+      | Vec xs ->
+        let i = Vec (List.map (fun v -> Apply (copy [] q, copy [] v)) xs) in
+        let e = to_anf i (fun i -> bndr.ctx <- CtxLet i; Binder (bndr, e)) in
+        drop' [q; Var v];
+        opt e
+      | _ -> Binder (bndr, opt e)
+  end
+
+  | Binder ({ ctx = CtxLet (Map2 (_, q, Var v1, Var v2)); _ } as bndr, e)
+    when lnode_is_singleton v1 && lnode_is_singleton v2 -> begin
+    match get_value (Var v1), get_value (Var v2) with
+      | Vec xs, Vec ys ->
+        let i = Vec (List.map2 (fun x y ->
+          Apply (Apply (copy [] q, copy [] x), copy [] y)) xs ys) in
+        let e = to_anf i (fun i -> bndr.ctx <- CtxLet i; Binder (bndr, e)) in
+        drop' [q; Var v1; Var v2];
+        opt e
+      | _ -> Binder (bndr, opt e)
+  end
+
+  | Binder ({ ctx = CtxLet i; _ } as bndr, e) -> begin
+    let i = opt i in
+    bndr.ctx <- CtxLet i;
+    let e = opt e in
+    match bndr.occ with
+      | None -> drop i; e
+      | _ -> Binder (bndr, e)
+  end
+
+  | Var _ as v -> begin
+    (* we only inline super simple values *)
+    match get_value v with
+      | Int _ | Str _ as i -> drop v; i
+      | _ -> v
+  end
+
+  | PrimBop (f, x, y) -> begin
+    match f, opt x, opt y with
+      | Add, Int l, Int r -> Int (Z.add l r)
+      | Sub, Int l, Int r -> Int (Z.sub l r)
+      | f, x, y -> PrimBop (f, x, y)
+  end
+
+  | Int _ | Str _ as v -> v
+  | Vec xs -> Vec (List.map opt xs)
+  | Insert (v, i, e) -> Insert (opt v, i, opt e)
+  | Apply (p, q) -> Apply (opt p, opt q)
+  | Map1 (tc, f, v) -> Map1 (tc, opt f, opt v)
+  | Map2 (tc, f, v1, v2) -> Map2 (tc, opt f, opt v1, opt v2)
 
 (* beyond this point it's just some gnode visualization code *)
 
@@ -332,6 +468,12 @@ let rec dump = function
       | Sub -> " - ");
     dump q;
     print_char ')'
+  | Apply (f, v) ->
+    print_string "(apply ";
+    dump f;
+    print_char ' ';
+    dump v;
+    print_char ')'
   | Map1 (tc, appf, v) ->
     print_string "(map1/";
     print_int (Option.value ~default:~-1 tc);
@@ -350,19 +492,20 @@ let rec dump = function
     print_char ' ';
     dump v2;
     print_char ')'
-  | Lam (v, n) ->
-    let v = find_root_binder v in
-    print_string "(\\";
-    print_string (Option.value ~default:"??" v.name);
-    print_string " -> ";
-    dump n;
-    print_char ')'
-  | LetVal (v, i, e) ->
-    let v = find_root_binder v in
-    print_string "(let ";
-    print_string (Option.value ~default:"??" v.name);
-    print_string " = ";
-    dump i;
-    print_string " in ";
-    dump e;
-    print_char ')'
+  | Binder (bndr, e) ->
+    match bndr.ctx with
+      | CtxChain _ -> print_string "#MALFORMED BINDER#"
+      | CtxLam ->
+        print_string "(\\";
+        print_string (Option.value ~default:"??" bndr.name);
+        print_string " -> ";
+        dump e;
+        print_char ')'
+      | CtxLet i ->
+        print_string "(let ";
+        print_string (Option.value ~default:"??" bndr.name);
+        print_string " = ";
+        dump i;
+        print_string " in ";
+        dump e;
+        print_char ')'

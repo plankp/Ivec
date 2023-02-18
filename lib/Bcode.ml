@@ -8,6 +8,7 @@ type bcode =
   | Dup                           (* v0 -> v0 v0 *)
   | DupX1                         (* v1 v0 -> v0 v1 v0 *)
   | DupX2                         (* v2 v1 v0 -> v0 v2 v1 v0 *)
+  | Call                          (* f v -> f(v) *)
   | IAdd                          (* v1 v2 -> v1 + v2 *)
   | ISub                          (* v1 v2 -> v1 - v2 *)
   | VCpy                          (* (v1 ... vn) -> (v1 ... vn) *)
@@ -45,13 +46,24 @@ let rec compile' s node cgs =
     | _ -> false in
 
   match node with
-    | Gir.Lam (v, n) ->
+    | Gir.Binder ({ ctx = CtxChain _; _ }, _) ->
+      failwith "IMPOSSIBLE BINDER STATE FOUND"
+
+    | Gir.Binder ({ ctx = CtxLam; _ } as v, e) ->
       (* fake closures: we shallow-copy the whole environment *)
       let index = s.index in
       let s = {
-        scope = (Gir.find_root_binder v, s.index) :: s.scope;
+        scope = (v, s.index) :: s.scope;
         index = s.index + 1 } in
-      add_instr (LdLam (index, compile s n)) cgs
+      add_instr (LdLam (index, compile s e)) cgs
+
+    | Gir.Binder ({ ctx = CtxLet i; _ } as v, e) ->
+      let cgs = compile' s i cgs in
+      let cgs = add_instr (StVar s.index) cgs in
+      let s = {
+        scope = (v, s.index) :: s.scope;
+        index = s.index + 1 } in
+      compile' s e cgs
 
     | Gir.Int v -> add_instr (LdInt v) cgs
     | Gir.Str v -> add_instr (LdStr v) cgs
@@ -62,17 +74,14 @@ let rec compile' s node cgs =
     | Gir.Var v ->
       let v = List.assq (Gir.find_root_binder v.data) s.scope in
       add_instr (LdVar v) cgs
-    | Gir.LetVal (v, i, e) ->
-      let cgs = compile' s i cgs in
-      let cgs = add_instr (StVar s.index) cgs in
-      let s = {
-        scope = (Gir.find_root_binder v, s.index) :: s.scope;
-        index = s.index + 1 } in
-      compile' s e cgs
+
     | Gir.PrimBop (Add, p, q) ->
       cgs |> compile' s p |> compile' s q |> add_instr IAdd
     | Gir.PrimBop (Sub, p, q) ->
       cgs |> compile' s p |> compile' s q |> add_instr ISub
+
+    | Gir.Apply (f, v) ->
+      cgs |> compile' s f |> compile' s v |> add_instr Call
 
     | Gir.Map1 (_, f, v) ->
       (* discard the trip count hint for now *)
@@ -199,6 +208,21 @@ let rec eval ibuf s =
           stack = t0 :: t2 :: t1 :: t0 :: s.stack }
 
     (* primitives *)
+      | Call -> begin
+        let< (v, s) = pop_stack s in
+        let< (f, s) = pop_stack s in
+        match f with
+          | Lam (lenv, larg, lbuf) ->
+            let lstate = { ip = 0; env = M.add larg v lenv; stack = [] } in
+            if s.ip + 1 = Array.length ibuf then
+              (* this is a tail call: discard the current frame *)
+              eval lbuf lstate
+            else begin
+              let< r = eval lbuf lstate in
+              eval ibuf { s with ip = s.ip + 1; stack = r :: s.stack }
+            end
+          | _ -> Error "Type mismatch"
+      end
       | IAdd -> imath Z.add s
       | ISub -> imath Z.sub s
       | VCpy -> begin
