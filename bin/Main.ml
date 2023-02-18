@@ -10,7 +10,9 @@ let () =
         let< (g, t) = Ivec.Gir.check Ivec.Gir.init_checkstate v in
         t |> Ivec.Gir.to_string |> print_endline;
         (*let g = Ivec.Gir.to_anf g (fun x -> x) in*)
-        (*Ivec.Gir.dump g; print_endline "";*)
+        Ivec.Gir.dump g; print_endline "";
+        let g = Ivec.Gir.opt [] g in
+        Ivec.Gir.dump g; print_endline "";
         let ibuf = Ivec.Bcode.compile Ivec.Bcode.init_cgstate g in
         let< v = Ivec.Bcode.eval ibuf Ivec.Bcode.init_evalstate in
         Ok (Some v) in
