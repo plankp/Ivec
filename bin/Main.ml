@@ -9,11 +9,15 @@ let () =
       | Some v ->
         let< (g, t) = Ivec.Gir.check Ivec.Gir.init_checkstate v in
         t |> Ivec.Gir.to_string |> print_endline;
+        Ivec.Gir.dump g; print_endline "";
+
+        let g = Ivec.Gir.opt_ds g in
+        Ivec.Gir.dump g; print_endline "";
 
         let g = Ivec.Gir.to_anf g (fun x -> x) in
         Ivec.Gir.dump g; print_endline "";
 
-        let g = Ivec.Gir.opt g in
+        let g = Ivec.Gir.opt_anf g in
         Ivec.Gir.dump g; print_endline "";
 
         let ibuf = Ivec.Bcode.compile Ivec.Bcode.init_cgstate g in

@@ -363,11 +363,14 @@ let get_value = function
   end
   | v -> v
 
-let rec opt = function
+let rec redux_ds modified = function
   | Binder ({ ctx = CtxChain _; _ }, _) ->
     failwith "IMPOSSIBLE BINDER STATE FOUND"
-  | Binder ({ ctx = CtxLam; _ } as bndr, e) -> Binder (bndr, opt e)
-  | Binder ({ ctx = CtxLet i; occ = None; _ }, e) -> drop i; opt e
+  | Binder ({ ctx = CtxLam; _ } as bndr, e) ->
+    let (e, modified) = redux_ds modified e in
+    (Binder (bndr, e), modified)
+  | Binder ({ ctx = CtxLet i; occ = None; _ }, e) ->
+    drop i; redux_ds true e
   | Binder ({ ctx = CtxLet (Var n as node); _ } as bndr, e) -> begin
     (* merge the binders *)
     bndr.ctx <- CtxChain (find_root_binder n.data);
@@ -375,7 +378,96 @@ let rec opt = function
     lnode_link n (Option.get bndr.occ);
     drop node;
     (* and then optimize the rhs *)
-    opt e
+    redux_ds true e
+  end
+  | Binder ({ ctx = CtxLet i; _ } as bndr, e) -> begin
+    let (i, modified) = redux_ds modified i in
+    bndr.ctx <- CtxLet i;
+    let (e, modified) = redux_ds modified e in
+    match bndr.occ with
+      | None -> drop i; (e, true)
+      | _ -> (Binder (bndr, e), modified)
+  end
+  | Map1 (tc1, f1, Map1 (tc2, f2, v)) -> begin
+    (* map / loop fusion *)
+    let tc = match tc1, tc2 with None, v | v, _ -> v in
+    let f = mk_binder None in
+    f.ctx <- CtxLam;
+    let e = Apply (f1, Apply (f2, mk_free_occ f)) in
+    let e = Map1 (tc, Binder (f, e), v) in
+    redux_ds true e
+  end
+  | Map1 (_, Binder ({ ctx = CtxLam; _ } as bndr, Var v), t)
+    when find_root_binder v.data == bndr ->
+    redux_ds true t
+  | Map1 (tc, f, v) ->
+    let (f, modified) = redux_ds modified f in
+    let (v, modified) = redux_ds modified v in
+    (Map1 (tc, f, v), modified)
+  | Map2 (tc, f1, v1, v2) -> begin
+    (* we may conditionally rewrite this into a map1 *)
+    let unpack_mapped_vec1 = function
+      | Var v -> Some (v, fun v -> v)
+      | Map1 (_, f, Var v) -> Some (v, fun v -> Apply (f, v))
+      | _ -> None in
+    match unpack_mapped_vec1 v1, unpack_mapped_vec1 v2 with
+      | Some (v1, fl), Some (v2, fr)
+        when find_root_binder v1.data == find_root_binder v2.data -> begin
+        drop (Var v2);
+        let f = mk_binder None in
+        f.ctx <- CtxLam;
+
+        let e = Apply (f1, f |> mk_free_occ |> fl) in
+        let e = Apply (e, f |> mk_free_occ |> fr) in
+        let e = Map1 (tc, Binder (f, e), Var v1) in
+        redux_ds true e
+      end
+      | _ ->
+        let (f1, modified) = redux_ds modified f1 in
+        let (v1, modified) = redux_ds modified v1 in
+        let (v2, modified) = redux_ds modified v2 in
+        (Map2 (tc, f1, v1, v2), modified)
+  end
+  | Apply (Binder ({ ctx = CtxLam; _ } as bndr, e), v) -> begin
+    (* beta reduction *)
+    bndr.ctx <- CtxLet v;
+    redux_ds true (Binder (bndr, e))
+  end
+  | Apply (f, v) ->
+    let (f, modified) = redux_ds modified f in
+    let (v, modified) = redux_ds modified v in
+    (Apply (f, v), modified)
+  | PrimBop (op, l, r) -> begin
+    match op, get_value l, get_value r with
+      | (Add | Sub), _, Int q when Z.zero = q ->
+        drop r; redux_ds true l
+      | Add, Int q, _ when Z.zero = q ->
+        drop l; redux_ds true r
+      | _ ->
+        let (l, modified) = redux_ds modified l in
+        let (r, modified) = redux_ds modified r in
+        (PrimBop (op, l, r), modified)
+  end
+  | t -> (t, modified)
+
+let rec opt_ds (t : gnode) =
+  match redux_ds false t with
+    | (t, true) -> opt_ds t
+    | (t, _) -> t
+
+let rec opt_anf = function
+  | Binder ({ ctx = CtxChain _; _ }, _) ->
+    failwith "IMPOSSIBLE BINDER STATE FOUND"
+  | Binder ({ ctx = CtxLam; _ } as bndr, e) -> Binder (bndr, opt_anf e)
+  | Binder ({ ctx = CtxLet i; occ = None; _ }, e) -> drop i; opt_anf e
+  | Binder ({ ctx = CtxLet (Var n as node); _ } as bndr, e) -> begin
+    (* merge the binders *)
+    bndr.ctx <- CtxChain (find_root_binder n.data);
+    (* update the occurrence list *)
+    lnode_link n (Option.get bndr.occ);
+    drop node;
+    (* and then optimize the rhs *)
+    opt_anf e
   end
 
   | Binder ({ ctx = CtxLet (Apply (Var f, q)); _ } as bndr, e) -> begin
@@ -385,8 +477,8 @@ let rec opt = function
         let i = Binder (next, copy [(prev, next)] le) in
         let e = to_anf i (fun i -> bndr.ctx <- CtxLet i; Binder (bndr, e)) in
         drop' [Var f; q];
-        opt e
-      | _ -> Binder (bndr, opt e)
+        opt_anf e
+      | _ -> Binder (bndr, opt_anf e)
   end
 
   | Binder ({ ctx = CtxLet (Map1 (_, q, Var v)); _ } as bndr, e)
@@ -396,8 +488,8 @@ let rec opt = function
         let i = Vec (List.map (fun v -> Apply (copy [] q, copy [] v)) xs) in
         let e = to_anf i (fun i -> bndr.ctx <- CtxLet i; Binder (bndr, e)) in
         drop' [q; Var v];
-        opt e
-      | _ -> Binder (bndr, opt e)
+        opt_anf e
+      | _ -> Binder (bndr, opt_anf e)
   end
 
   | Binder ({ ctx = CtxLet (Map2 (_, q, Var v1, Var v2)); _ } as bndr, e)
@@ -408,14 +500,14 @@ let rec opt = function
           Apply (Apply (copy [] q, copy [] x), copy [] y)) xs ys) in
         let e = to_anf i (fun i -> bndr.ctx <- CtxLet i; Binder (bndr, e)) in
         drop' [q; Var v1; Var v2];
-        opt e
-      | _ -> Binder (bndr, opt e)
+        opt_anf e
+      | _ -> Binder (bndr, opt_anf e)
   end
 
   | Binder ({ ctx = CtxLet i; _ } as bndr, e) -> begin
-    let i = opt i in
+    let i = opt_anf i in
     bndr.ctx <- CtxLet i;
-    let e = opt e in
+    let e = opt_anf e in
     match bndr.occ with
       | None -> drop i; e
       | _ -> Binder (bndr, e)
@@ -429,18 +521,18 @@ let rec opt = function
   end
 
   | PrimBop (f, x, y) -> begin
-    match f, opt x, opt y with
+    match f, opt_anf x, opt_anf y with
       | Add, Int l, Int r -> Int (Z.add l r)
       | Sub, Int l, Int r -> Int (Z.sub l r)
       | f, x, y -> PrimBop (f, x, y)
   end
 
   | Int _ | Str _ as v -> v
-  | Vec xs -> Vec (List.map opt xs)
-  | Insert (v, i, e) -> Insert (opt v, i, opt e)
-  | Apply (p, q) -> Apply (opt p, opt q)
-  | Map1 (tc, f, v) -> Map1 (tc, opt f, opt v)
-  | Map2 (tc, f, v1, v2) -> Map2 (tc, opt f, opt v1, opt v2)
+  | Vec xs -> Vec (List.map opt_anf xs)
+  | Insert (v, i, e) -> Insert (opt_anf v, i, opt_anf e)
+  | Apply (p, q) -> Apply (opt_anf p, opt_anf q)
+  | Map1 (tc, f, v) -> Map1 (tc, opt_anf f, opt_anf v)
+  | Map2 (tc, f, v1, v2) -> Map2 (tc, opt_anf f, opt_anf v1, opt_anf v2)
 
 (* beyond this point it's just some gnode visualization code *)
 
